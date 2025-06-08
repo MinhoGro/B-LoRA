@@ -1858,6 +1858,10 @@ def main(args):
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
+            if accelerator.is_main_process:
+                with open(os.path.join(args.output_dir, "lr_loss.txt"), "a") as f:
+                    f.write(f"{global_step}\t{logs['lr']}\t{logs['loss']}\n")
+
             if global_step >= args.max_train_steps:
                 break
 
