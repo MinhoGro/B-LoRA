@@ -1248,7 +1248,16 @@ def main(args):
             )
         )
 
-        ot_proc = SinkhornOTAttnProcessor(attn_module.head_dim, n_iters=args.ot_sinkhorn_iters)
+        head_dim = getattr(attn_module, "head_dim", None)
+        if head_dim is None:
+            num_heads = getattr(attn_module, "num_heads", None)
+            if num_heads is None:
+                num_heads = getattr(attn_module, "heads", None)
+            if num_heads is not None:
+                head_dim = attn_module.to_q.out_features // num_heads
+            else:
+                head_dim = attn_module.to_q.out_features
+        ot_proc = SinkhornOTAttnProcessor(head_dim, n_iters=args.ot_sinkhorn_iters)
 
         attn_module.set_processor(ot_proc)
         unet_ot_parameters.extend(ot_proc.parameters())
