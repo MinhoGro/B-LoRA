@@ -994,8 +994,9 @@ def filter_lora_layers(lora_state_dict: dict, groups: list) -> dict:
 
 
 def compute_ot_distill_loss(unet):
+    model = unet.module if hasattr(unet, "module") else unet
     loss = 0.0
-    for proc in unet.attn_processors.values():
+    for proc in model.attn_processors.values():
         if isinstance(proc, SinkhornOTAttnProcessor) and proc.last_ot is not None:
             loss = loss + F.mse_loss(proc.last_ot, proc.last_soft)
     return loss
@@ -1870,7 +1871,6 @@ def main(args):
                     params_to_clip = (
                         itertools.chain(
                             unet_lora_parameters,
-
                             unet_ot_parameters,
                             text_lora_parameters_one,
                             text_lora_parameters_two,
@@ -1935,13 +1935,11 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
-
             if accelerator.is_main_process:
                 with open(os.path.join(args.output_dir, "lr_loss.txt"), "a") as f:
                     f.write(f"{global_step}\t{logs['lr']}\t{logs['loss']}\n")
 
             if global_step >= total_steps:
-
                 break
 
         if accelerator.is_main_process:
