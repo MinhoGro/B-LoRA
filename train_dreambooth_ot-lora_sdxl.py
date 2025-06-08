@@ -1857,6 +1857,7 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+
             if accelerator.is_main_process:
                 with open(os.path.join(args.output_dir, "lr_loss.txt"), "a") as f:
                     f.write(f"{global_step}\t{logs['lr']}\t{logs['loss']}\n")
