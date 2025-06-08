@@ -995,9 +995,21 @@ def filter_lora_layers(lora_state_dict: dict, groups: list) -> dict:
 
 def compute_ot_distill_loss(unet):
     model = unet.module if hasattr(unet, "module") else unet
+
+    # Collect attention processors either from the dedicated attribute or
+    # by traversing the module tree for submodules that expose a `processor`
+    processors = []
+    attn_procs = getattr(model, "attn_processors", None)
+    if attn_procs is not None:
+        processors.extend(attn_procs.values())
+    else:
+        for module in model.modules():
+            if hasattr(module, "processor"):
+                processors.append(module.processor)
+
     loss = 0.0
-    for proc in model.attn_processors.values():
-        if isinstance(proc, SinkhornOTAttnProcessor) and proc.last_ot is not None:
+    for proc in processors:
+        if isinstance(proc, SinkhornOTAttnProcessor) and getattr(proc, "last_ot", None) is not None:
             loss = loss + F.mse_loss(proc.last_ot, proc.last_soft)
     return loss
 
