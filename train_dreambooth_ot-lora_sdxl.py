@@ -70,12 +70,13 @@ logger = get_logger(__name__)
 class SinkhornOTAttnProcessor(nn.Module):
     """Attention processor using Sinkhorn Optimal Transport with learnable cost."""
 
-    def __init__(self, hidden_size: int, n_iters: int = 20, eps: float = 1e-3):
+    def __init__(self, head_dim: int, n_iters: int = 20, eps: float = 1e-3):
         super().__init__()
         self.n_iters = n_iters
         self.eps = eps
-        self.q_cost_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_cost_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_cost_proj = nn.Linear(head_dim, head_dim, bias=False)
+        self.k_cost_proj = nn.Linear(head_dim, head_dim, bias=False)
+
         self.log_temp = nn.Parameter(torch.zeros(1))
         self.last_ot = None
         self.last_soft = None
@@ -696,7 +697,7 @@ def parse_args(input_args=None):
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
-    
+
     parser.add_argument(
         "--pretrain_ot_steps",
         type=int,
@@ -1247,7 +1248,8 @@ def main(args):
             )
         )
 
-        ot_proc = SinkhornOTAttnProcessor(attn_module.to_q.in_features, n_iters=args.ot_sinkhorn_iters)
+        ot_proc = SinkhornOTAttnProcessor(attn_module.head_dim, n_iters=args.ot_sinkhorn_iters)
+
         attn_module.set_processor(ot_proc)
         unet_ot_parameters.extend(ot_proc.parameters())
 
