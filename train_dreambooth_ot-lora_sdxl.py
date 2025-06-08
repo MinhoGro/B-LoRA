@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -66,12 +67,18 @@ check_min_version("0.24.0.dev0")
 logger = get_logger(__name__)
 
 
-class SinkhornOTAttnProcessor:
-    """Attention processor using Sinkhorn Optimal Transport."""
+class SinkhornOTAttnProcessor(nn.Module):
+    """Attention processor using Sinkhorn Optimal Transport with learnable cost."""
 
-    def __init__(self, n_iters: int = 20, eps: float = 1e-3):
+    def __init__(self, hidden_size: int, n_iters: int = 20, eps: float = 1e-3):
+        super().__init__()
         self.n_iters = n_iters
         self.eps = eps
+        self.q_cost_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_cost_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.log_temp = nn.Parameter(torch.zeros(1))
+        self.last_ot = None
+        self.last_soft = None
 
     def _sinkhorn(self, log_scores):
         for _ in range(self.n_iters):
@@ -92,11 +99,20 @@ class SinkhornOTAttnProcessor:
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
-        attn_scores = torch.bmm(query, key.transpose(-1, -2)) * attn.scale
+        q_cost = self.q_cost_proj(query)
+        k_cost = self.k_cost_proj(key)
+        cost = (
+            (q_cost ** 2).sum(-1, keepdim=True)
+            + (k_cost ** 2).sum(-1).unsqueeze(-2)
+            - 2 * torch.bmm(q_cost, k_cost.transpose(-1, -2))
+        )
+        log_scores = -cost / torch.exp(self.log_temp)
         if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
+            log_scores = log_scores + attention_mask
 
-        attn_probs = self._sinkhorn(attn_scores)
+        self.last_soft = torch.softmax(log_scores, dim=-1)
+        attn_probs = self._sinkhorn(log_scores)
+        self.last_ot = attn_probs
 
         hidden_states = torch.bmm(attn_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
@@ -680,6 +696,19 @@ def parse_args(input_args=None):
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
+    
+    parser.add_argument(
+        "--pretrain_ot_steps",
+        type=int,
+        default=0,
+        help="Number of warm-up steps for OT attention distillation.",
+    )
+    parser.add_argument(
+        "--ot_sinkhorn_iters",
+        type=int,
+        default=20,
+        help="Sinkhorn iterations for OT attention.",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -963,6 +992,14 @@ def filter_lora_layers(lora_state_dict: dict, groups: list) -> dict:
         raise type(e)(f'failed to filter_lora_layers, due to: {e}')
 
 
+def compute_ot_distill_loss(unet):
+    loss = 0.0
+    for proc in unet.attn_processors.values():
+        if isinstance(proc, SinkhornOTAttnProcessor) and proc.last_ot is not None:
+            loss = loss + F.mse_loss(proc.last_ot, proc.last_soft)
+    return loss
+
+
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -1170,6 +1207,8 @@ def main(args):
     # now we will add new LoRA weights to the attention layers
     # Set correct lora layers
     unet_lora_parameters = []
+    unet_ot_parameters = []
+
     for attn_processor_name, attn_processor in unet.attn_processors.items():
         # Parse the attention module.
         if not is_belong_to_groups(attn_processor_name, OT_BLOCKS):
@@ -1207,7 +1246,10 @@ def main(args):
                 rank=args.rank,
             )
         )
-        attn_module.set_processor(SinkhornOTAttnProcessor())
+
+        ot_proc = SinkhornOTAttnProcessor(attn_module.to_q.in_features, n_iters=args.ot_sinkhorn_iters)
+        attn_module.set_processor(ot_proc)
+        unet_ot_parameters.extend(ot_proc.parameters())
 
         # Accumulate the LoRA params to optimize.
         unet_lora_parameters.extend(attn_module.to_q.lora_layer.parameters())
@@ -1323,7 +1365,16 @@ def main(args):
     unet_lora_parameters_with_lr = {
         "params": unet_lora_parameters,
         "lr": args.learning_rate,
+        "name": "lora",
     }
+    ot_parameters_with_lr = {
+        "params": unet_ot_parameters,
+        "lr": args.learning_rate,
+        "name": "ot",
+    }
+    if args.pretrain_ot_steps > 0:
+        unet_lora_parameters_with_lr["lr"] = 0.0
+
     if args.train_text_encoder:
         # different learning rate for text encoder and unet
         text_lora_parameters_one_with_lr = {
@@ -1338,11 +1389,12 @@ def main(args):
         }
         params_to_optimize = [
             unet_lora_parameters_with_lr,
+            ot_parameters_with_lr,
             text_lora_parameters_one_with_lr,
             text_lora_parameters_two_with_lr,
         ]
     else:
-        params_to_optimize = [unet_lora_parameters_with_lr]
+        params_to_optimize = [unet_lora_parameters_with_lr, ot_parameters_with_lr]
 
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
@@ -1535,7 +1587,7 @@ def main(args):
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_training_steps=total_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
@@ -1592,7 +1644,8 @@ def main(args):
         f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
     )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    total_steps = args.max_train_steps + args.pretrain_ot_steps
+    logger.info(f"  Total optimization steps = {total_steps}")
     global_step = 0
     first_epoch = 0
 
@@ -1625,7 +1678,7 @@ def main(args):
         initial_global_step = 0
 
     progress_bar = tqdm(
-        range(0, args.max_train_steps),
+        range(0, total_steps),
         initial=initial_global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
@@ -1795,16 +1848,24 @@ def main(args):
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
 
+                distill_loss = compute_ot_distill_loss(unet)
+                if global_step < args.pretrain_ot_steps:
+                    loss = distill_loss
+                else:
+                    loss = loss + distill_loss
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = (
                         itertools.chain(
                             unet_lora_parameters,
+
+                            unet_ot_parameters,
                             text_lora_parameters_one,
                             text_lora_parameters_two,
                         )
                         if args.train_text_encoder
-                        else unet_lora_parameters
+                        else itertools.chain(unet_lora_parameters, unet_ot_parameters)
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
@@ -1815,6 +1876,12 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                if global_step == args.pretrain_ot_steps:
+                    for g in optimizer.param_groups:
+                        if g.get("name") == "lora":
+                            g["lr"] = args.learning_rate
+                        if g.get("name") == "ot":
+                            g["lr"] = 0.0
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
@@ -1862,7 +1929,8 @@ def main(args):
                 with open(os.path.join(args.output_dir, "lr_loss.txt"), "a") as f:
                     f.write(f"{global_step}\t{logs['lr']}\t{logs['loss']}\n")
 
-            if global_step >= args.max_train_steps:
+            if global_step >= total_steps:
+
                 break
 
         if accelerator.is_main_process:
