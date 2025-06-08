@@ -76,6 +76,7 @@ class SinkhornOTAttnProcessor(nn.Module):
         self.eps = eps
         self.q_cost_proj = nn.Linear(head_dim, head_dim, bias=False)
         self.k_cost_proj = nn.Linear(head_dim, head_dim, bias=False)
+
         self.log_temp = nn.Parameter(torch.zeros(1))
         self.last_ot = None
         self.last_soft = None
@@ -696,6 +697,7 @@ def parse_args(input_args=None):
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
+
     parser.add_argument(
         "--pretrain_ot_steps",
         type=int,
@@ -1208,6 +1210,7 @@ def main(args):
     # Set correct lora layers
     unet_lora_parameters = []
     unet_ot_parameters = []
+
     for attn_processor_name, attn_processor in unet.attn_processors.items():
         # Parse the attention module.
         if not is_belong_to_groups(attn_processor_name, OT_BLOCKS):
@@ -1245,6 +1248,7 @@ def main(args):
                 rank=args.rank,
             )
         )
+
         head_dim = getattr(attn_module, "head_dim", None)
         if head_dim is None:
             num_heads = getattr(attn_module, "num_heads", None)
@@ -1255,6 +1259,7 @@ def main(args):
             else:
                 head_dim = attn_module.to_q.out_features
         ot_proc = SinkhornOTAttnProcessor(head_dim, n_iters=args.ot_sinkhorn_iters)
+
         attn_module.set_processor(ot_proc)
         unet_ot_parameters.extend(ot_proc.parameters())
 
@@ -1381,6 +1386,7 @@ def main(args):
     }
     if args.pretrain_ot_steps > 0:
         unet_lora_parameters_with_lr["lr"] = 0.0
+
     if args.train_text_encoder:
         # different learning rate for text encoder and unet
         text_lora_parameters_one_with_lr = {
