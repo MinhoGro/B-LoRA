@@ -1634,6 +1634,10 @@ def main(args):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
+    # Compute total optimization steps before creating the scheduler so it can
+    # be used for learning rate scheduling.
+    total_steps = args.max_train_steps + args.pretrain_ot_steps
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
