@@ -24,9 +24,10 @@ from typing import List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel, AutoencoderKL
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, CLIPTextModel
 
 
 # -----------------------------------------------------------------------------
@@ -87,6 +88,8 @@ class SinkhornOTAttnProcessor(nn.Module):
         self.log_eps = nn.Parameter(torch.log(torch.tensor(eps)))
         self.q_cost = nn.Linear(head_dim, head_dim, bias=False)
         self.k_cost = nn.Linear(head_dim, head_dim, bias=False)
+        self.last_ot: torch.Tensor | None = None
+        self.last_soft: torch.Tensor | None = None
 
     def _sinkhorn(self, scores: torch.Tensor) -> torch.Tensor:
         for _ in range(self.n_iters):
@@ -119,7 +122,10 @@ class SinkhornOTAttnProcessor(nn.Module):
         log_scores = -cost / torch.exp(self.log_eps)
         if attention_mask is not None:
             log_scores = log_scores + attention_mask
+
+        self.last_soft = torch.softmax(log_scores, dim=-1)
         transport = self._sinkhorn(log_scores)
+        self.last_ot = transport
         hidden_states = transport @ v
         hidden_states = attn.batch_to_head_dim(hidden_states)
         hidden_states = attn.to_out[0](hidden_states)
@@ -143,7 +149,7 @@ def inject_ot_attention(unet: UNet2DConditionModel, n_iters: int = 5, eps: float
 
 def apply_lora(unet: UNet2DConditionModel, rank: int = 8):
     lora_cfg = LoraConfig(r=rank, target_modules=["to_q", "to_v", "q_cost", "k_cost", "log_eps"])
-    get_peft_model(unet, lora_cfg)
+    return get_peft_model(unet, lora_cfg)
 
 
 # -----------------------------------------------------------------------------
@@ -156,9 +162,12 @@ def ot_distillation_loop(unet: UNet2DConditionModel, dataloader, optimizer, n_st
         if step >= n_steps:
             break
         noisy_latents, encoder_hidden_states = batch
-        preds = unet(noisy_latents, encoder_hidden_states=encoder_hidden_states).sample
-        mse = ((unet.attn_processors[list(unet.attn_processors.keys())[0]].last_soft -
-                unet.attn_processors[list(unet.attn_processors.keys())[0]].last_ot) ** 2).mean()
+        timesteps = torch.randint(0, 1000, (noisy_latents.shape[0],), device=noisy_latents.device)
+        _ = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+        mse = 0.0
+        for proc in unet.attn_processors.values():
+            if isinstance(proc, SinkhornOTAttnProcessor) and proc.last_ot is not None:
+                mse = mse + F.mse_loss(proc.last_ot, proc.last_soft)
         mse.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -174,7 +183,11 @@ def style_lora_finetune(unet: UNet2DConditionModel, dataloader, optimizer, n_ste
         if step >= n_steps:
             break
         noisy_latents, noise_pred = batch
-        pred = unet(noisy_latents).sample
+        timesteps = torch.randint(0, 1000, (noisy_latents.shape[0],), device=noisy_latents.device)
+        encoder_hidden_states = torch.randn(
+            noisy_latents.shape[0], 77, unet.config.cross_attention_dim, device=noisy_latents.device
+        )
+        pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
         loss = ((pred - noise_pred) ** 2).mean()
         loss.backward()
         optimizer.step()
@@ -207,7 +220,7 @@ def load_pipeline(base: str, ot_weights: str | None = None, lora_weights: str | 
 
 def main(args):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    text_encoder = StableDiffusionXLPipeline.from_pretrained(args.model, subfolder="text_encoder").text_encoder
+    text_encoder = CLIPTextModel.from_pretrained(args.model, subfolder="text_encoder")
 
     # Prompt OT decomposition
     res = prompt_ot_split(args.prompt, tokenizer, text_encoder)
@@ -217,7 +230,7 @@ def main(args):
     # Prepare UNet
     unet = UNet2DConditionModel.from_pretrained(args.model, subfolder="unet")
     inject_ot_attention(unet)
-    apply_lora(unet)
+    unet = apply_lora(unet)
 
     # Dummy dataloaders & optimizers here (placeholders for real code)
     dummy_data = [(
