@@ -154,6 +154,24 @@ def text_encoder_lora_state_dict(text_encoder):
     return state_dict
 
 
+def unet_ot_state_dict(unet):
+    """Return the state dict of all SinkhornOTAttnProcessor layers in the UNet."""
+    state_dict = {}
+    attn_procs = getattr(unet, "attn_processors", {})
+    for name, proc in attn_procs.items():
+        if isinstance(proc, SinkhornOTAttnProcessor):
+            state_dict[name] = proc.state_dict()
+    return state_dict
+
+
+def load_ot_into_unet(unet, state_dict):
+    """Load OT processor weights into the UNet."""
+    attn_procs = getattr(unet, "attn_processors", {})
+    for name, proc in attn_procs.items():
+        if name in state_dict and isinstance(proc, SinkhornOTAttnProcessor):
+            proc.load_state_dict(state_dict[name])
+
+
 def save_model_card(
         repo_id: str,
         images=None,
@@ -995,9 +1013,21 @@ def filter_lora_layers(lora_state_dict: dict, groups: list) -> dict:
 
 def compute_ot_distill_loss(unet):
     model = unet.module if hasattr(unet, "module") else unet
+
+    # Collect attention processors either from the dedicated attribute or
+    # by traversing the module tree for submodules that expose a `processor`
+    processors = []
+    attn_procs = getattr(model, "attn_processors", None)
+    if attn_procs is not None:
+        processors.extend(attn_procs.values())
+    else:
+        for module in model.modules():
+            if hasattr(module, "processor"):
+                processors.append(module.processor)
+
     loss = 0.0
-    for proc in model.attn_processors.values():
-        if isinstance(proc, SinkhornOTAttnProcessor) and proc.last_ot is not None:
+    for proc in processors:
+        if isinstance(proc, SinkhornOTAttnProcessor) and getattr(proc, "last_ot", None) is not None:
             loss = loss + F.mse_loss(proc.last_ot, proc.last_soft)
     return loss
 
@@ -1286,12 +1316,14 @@ def main(args):
             # there are only two options here. Either are just the unet attn processor layers
             # or there are the unet and text encoder atten layers
             unet_lora_layers_to_save = None
+            unet_ot_layers_to_save = None
             text_encoder_one_lora_layers_to_save = None
             text_encoder_two_lora_layers_to_save = None
 
             for model in models:
                 if isinstance(model, type(accelerator.unwrap_model(unet))):
                     unet_lora_layers_to_save = unet_lora_state_dict(model)
+                    unet_ot_layers_to_save = unet_ot_state_dict(model)
                 elif isinstance(
                         model, type(accelerator.unwrap_model(text_encoder_one))
                 ):
@@ -1316,6 +1348,8 @@ def main(args):
                 text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
                 text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
             )
+            if unet_ot_layers_to_save is not None:
+                torch.save(unet_ot_layers_to_save, os.path.join(output_dir, "unet_ot.bin"))
 
     def load_model_hook(models, input_dir):
         unet_ = None
@@ -1338,6 +1372,11 @@ def main(args):
         LoraLoaderMixin.load_lora_into_unet(
             lora_state_dict, network_alphas=network_alphas, unet=unet_
         )
+
+        ot_path = os.path.join(input_dir, "unet_ot.bin")
+        if os.path.isfile(ot_path):
+            ot_state = torch.load(ot_path, map_location="cpu")
+            load_ot_into_unet(unet_, ot_state)
 
         text_encoder_state_dict = {
             k: v for k, v in lora_state_dict.items() if "text_encoder." in k
@@ -1697,6 +1736,15 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    distill_bar = None
+    if args.pretrain_ot_steps > 0 and initial_global_step < args.pretrain_ot_steps:
+        distill_bar = tqdm(
+            range(args.pretrain_ot_steps),
+            initial=initial_global_step,
+            desc="Distill",
+            disable=not accelerator.is_local_main_process,
+        )
+
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         if args.train_text_encoder:
@@ -1886,6 +1934,10 @@ def main(args):
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
+                if distill_bar is not None and global_step < args.pretrain_ot_steps:
+                    distill_bar.update(1)
+                    if global_step + 1 == args.pretrain_ot_steps:
+                        distill_bar.close()
                 global_step += 1
                 if global_step == args.pretrain_ot_steps:
                     for g in optimizer.param_groups:
@@ -2049,6 +2101,7 @@ def main(args):
             text_encoder_lora_layers=text_encoder_lora_layers,
             text_encoder_2_lora_layers=text_encoder_2_lora_layers,
         )
+        torch.save(unet_ot_state_dict(unet), os.path.join(args.output_dir, "unet_ot.bin"))
 
         # remove unuse models for save GPU memory
         unet = unet.cpu()
@@ -2091,6 +2144,10 @@ def main(args):
 
         # load attention processors
         pipeline.load_lora_weights(args.output_dir)
+        ot_path = os.path.join(args.output_dir, "unet_ot.bin")
+        if os.path.isfile(ot_path):
+            ot_state = torch.load(ot_path, map_location="cpu")
+            load_ot_into_unet(pipeline.unet, ot_state)
 
         # run inference
         images = []
