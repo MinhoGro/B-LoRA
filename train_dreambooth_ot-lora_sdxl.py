@@ -154,6 +154,24 @@ def text_encoder_lora_state_dict(text_encoder):
     return state_dict
 
 
+def unet_ot_state_dict(unet):
+    """Return the state dict of all SinkhornOTAttnProcessor layers in the UNet."""
+    state_dict = {}
+    attn_procs = getattr(unet, "attn_processors", {})
+    for name, proc in attn_procs.items():
+        if isinstance(proc, SinkhornOTAttnProcessor):
+            state_dict[name] = proc.state_dict()
+    return state_dict
+
+
+def load_ot_into_unet(unet, state_dict):
+    """Load OT processor weights into the UNet."""
+    attn_procs = getattr(unet, "attn_processors", {})
+    for name, proc in attn_procs.items():
+        if name in state_dict and isinstance(proc, SinkhornOTAttnProcessor):
+            proc.load_state_dict(state_dict[name])
+
+
 def save_model_card(
         repo_id: str,
         images=None,
@@ -1298,12 +1316,14 @@ def main(args):
             # there are only two options here. Either are just the unet attn processor layers
             # or there are the unet and text encoder atten layers
             unet_lora_layers_to_save = None
+            unet_ot_layers_to_save = None
             text_encoder_one_lora_layers_to_save = None
             text_encoder_two_lora_layers_to_save = None
 
             for model in models:
                 if isinstance(model, type(accelerator.unwrap_model(unet))):
                     unet_lora_layers_to_save = unet_lora_state_dict(model)
+                    unet_ot_layers_to_save = unet_ot_state_dict(model)
                 elif isinstance(
                         model, type(accelerator.unwrap_model(text_encoder_one))
                 ):
@@ -1328,6 +1348,8 @@ def main(args):
                 text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
                 text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
             )
+            if unet_ot_layers_to_save is not None:
+                torch.save(unet_ot_layers_to_save, os.path.join(output_dir, "unet_ot.bin"))
 
     def load_model_hook(models, input_dir):
         unet_ = None
@@ -1350,6 +1372,11 @@ def main(args):
         LoraLoaderMixin.load_lora_into_unet(
             lora_state_dict, network_alphas=network_alphas, unet=unet_
         )
+
+        ot_path = os.path.join(input_dir, "unet_ot.bin")
+        if os.path.isfile(ot_path):
+            ot_state = torch.load(ot_path, map_location="cpu")
+            load_ot_into_unet(unet_, ot_state)
 
         text_encoder_state_dict = {
             k: v for k, v in lora_state_dict.items() if "text_encoder." in k
@@ -2061,6 +2088,7 @@ def main(args):
             text_encoder_lora_layers=text_encoder_lora_layers,
             text_encoder_2_lora_layers=text_encoder_2_lora_layers,
         )
+        torch.save(unet_ot_state_dict(unet), os.path.join(args.output_dir, "unet_ot.bin"))
 
         # remove unuse models for save GPU memory
         unet = unet.cpu()
@@ -2103,6 +2131,10 @@ def main(args):
 
         # load attention processors
         pipeline.load_lora_weights(args.output_dir)
+        ot_path = os.path.join(args.output_dir, "unet_ot.bin")
+        if os.path.isfile(ot_path):
+            ot_state = torch.load(ot_path, map_location="cpu")
+            load_ot_into_unet(pipeline.unet, ot_state)
 
         # run inference
         images = []

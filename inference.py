@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import torch
 from diffusers import StableDiffusionXLPipeline, AutoencoderKL
@@ -68,6 +69,9 @@ def parse_args():
     parser.add_argument(
         "--num_images_per_prompt", type=int, default=4, help="number of images per prompt"
     )
+    parser.add_argument(
+        "--ot_weights", type=str, default=None, help="path to distilled OT weights"
+    )
     return parser.parse_args()
 
 
@@ -100,14 +104,29 @@ if __name__ == '__main__':
     # Load
     pipeline.load_lora_into_unet(res_lora, None, pipeline.unet)
 
-    # Replace attention processors with Sinkhorn OT
+    # Replace attention processors with Sinkhorn OT and optionally load weights
     OT_BLOCKS = ['up_blocks.0.attentions.0', 'up_blocks.0.attentions.1']
+    ot_state = {}
+    if args.ot_weights is not None:
+        ot_state = torch.load(args.ot_weights, map_location="cpu")
     for attn_processor_name, _ in pipeline.unet.attn_processors.items():
         if any(attn_processor_name.startswith(b) for b in OT_BLOCKS):
             attn_module = pipeline.unet
             for n in attn_processor_name.split('.')[:-1]:
                 attn_module = getattr(attn_module, n)
-            attn_module.set_processor(SinkhornOTAttnProcessor())
+            head_dim = getattr(attn_module, "head_dim", None)
+            if head_dim is None:
+                num_heads = getattr(attn_module, "num_heads", None)
+                if num_heads is None:
+                    num_heads = getattr(attn_module, "heads", None)
+                if num_heads is not None:
+                    head_dim = attn_module.to_q.out_features // num_heads
+                else:
+                    head_dim = attn_module.to_q.out_features
+            ot_proc = SinkhornOTAttnProcessor(head_dim)
+            if attn_processor_name in ot_state:
+                ot_proc.load_state_dict(ot_state[attn_processor_name])
+            attn_module.set_processor(ot_proc)
 
     # Generate
     images = pipeline(args.prompt, num_images_per_prompt=args.num_images_per_prompt).images
