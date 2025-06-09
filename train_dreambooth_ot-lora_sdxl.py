@@ -1736,6 +1736,15 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    distill_bar = None
+    if args.pretrain_ot_steps > 0 and initial_global_step < args.pretrain_ot_steps:
+        distill_bar = tqdm(
+            range(args.pretrain_ot_steps),
+            initial=initial_global_step,
+            desc="Distill",
+            disable=not accelerator.is_local_main_process,
+        )
+
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         if args.train_text_encoder:
@@ -1925,6 +1934,10 @@ def main(args):
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
+                if distill_bar is not None and global_step < args.pretrain_ot_steps:
+                    distill_bar.update(1)
+                    if global_step + 1 == args.pretrain_ot_steps:
+                        distill_bar.close()
                 global_step += 1
                 if global_step == args.pretrain_ot_steps:
                     for g in optimizer.param_groups:
