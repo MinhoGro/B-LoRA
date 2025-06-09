@@ -13,6 +13,8 @@ class SinkhornOTAttnProcessor:
     def __init__(self, n_iters: int = 20, eps: float = 1e-3):
         self.n_iters = n_iters
         self.eps = eps
+        self.last_ot = None
+        self.last_soft = None
 
     def _sinkhorn(self, log_scores):
         for _ in range(self.n_iters):
@@ -37,7 +39,9 @@ class SinkhornOTAttnProcessor:
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
 
+        self.last_soft = torch.softmax(attn_scores, dim=-1)
         attn_probs = self._sinkhorn(attn_scores)
+        self.last_ot = attn_probs
 
         hidden_states = torch.bmm(attn_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
